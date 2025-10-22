@@ -21,7 +21,9 @@ COUPON_EXPIRES_DAYS = int(os.getenv("COUPON_EXPIRES_DAYS","30"))
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
-bot = Bot(BOT_TOKEN, parse_mode="HTML")
+from aiogram.client.default import DefaultBotProperties
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+
 dp = Dispatcher()
 tz = ZoneInfo(TIMEZONE)
 scheduler = AsyncIOScheduler(timezone=tz)
