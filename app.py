@@ -108,7 +108,7 @@ async def _maybe_alert(feedback_id: int, username: str, table_hint: str, comment
         return
     text = f"⚠️ <b>Сигнал гостя</b>"
 От: @{username or 'unknown'}
-{table_hint}"
+"{table_hint}"
     if comment:
         text += f"Комментарий: <i>{comment}</i>"
     text += f"ID отзыва: #{feedback_id}"
