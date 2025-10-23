@@ -111,7 +111,7 @@ text = f"От: @{username or 'unknown'}"
 "{table_hint}"
 if comment:
         text += f"Комментарий: <i>{comment}</i>"
-    text += f"ID отзыва: #{feedback_id}"
+        text += f"ID отзыва: #{feedback_id}"
     await bot.send_message(MANAGERS_CHAT_ID, text, reply_markup=manager_kb(feedback_id))
 
 def _store_rating(user_id: int, step: str, value: int, visit_id: str):
