@@ -72,8 +72,7 @@ async def cmd_start(message: Message, command: CommandObject):
 
     if visit_id:
         if await visit_used(visit_id):
-            await message.answer("❗️ По этому визиту отзыв уже был оставлен.
-Спасибо за участие!")
+            await message.answer("""❗️ По этому визиту отзыв уже был оставлен.Спасибо за участие!""")
             return
         await create_feedback_placeholder(message.from_user.id, visit_id)
         await message.answer(
