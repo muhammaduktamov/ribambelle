@@ -12,7 +12,25 @@ from dotenv import load_dotenv
 from db import get_conn, init_db
 from keyboards import rating_kb, start_kb, manager_kb, prize_kb
 from prizes import DEFAULT_PRIZES, weighted_choice, gen_code
+import os, socket, time
+from aiogram import Router, F
+from aiogram.types import Message
+router = Router()
 
+START_TS = time.time()
+
+@router.message(F.text == "/where")
+async def where_am_i(message: Message):
+    host = socket.gethostname()
+    pid = os.getpid()
+    up = int(time.time() - START_TS)
+    token_tail = os.getenv("BOT_TOKEN", "")[-6:]  # только хвост токена
+    await message.answer(
+        f"🤖 Я запущен на: <b>{host}</b>\n"
+        f"PID: <code>{pid}</code>\n"
+        f"Uptime: {up} сек\n"
+        f"Token…{token_tail}"
+    )
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SECRET_KEY = os.getenv("SECRET_KEY", "change_this_secret").encode()
