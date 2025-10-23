@@ -1,10 +1,14 @@
-import os, asyncio, logging, sqlite3, random, string
+import os, asyncio, logging, sqlite3, random
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
+)
 from aiogram.filters import Command, CommandStart
+from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 
@@ -17,13 +21,13 @@ TIMEZONE = os.getenv("TIMEZONE","Asia/Tashkent")
 SURVEY_HOUR = int(os.getenv("SURVEY_HOUR","10"))
 DISCOUNT_PERCENT = int(os.getenv("DISCOUNT_PERCENT","10"))
 COUPON_EXPIRES_DAYS = int(os.getenv("COUPON_EXPIRES_DAYS","30"))
+SURVEY_MODE = os.getenv("SURVEY_MODE", "immediate")  # immediate | scheduled
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
-from aiogram.client.default import DefaultBotProperties
+# aiogram 3.7+: parse_mode через DefaultBotProperties
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-
 dp = Dispatcher()
 tz = ZoneInfo(TIMEZONE)
 scheduler = AsyncIOScheduler(timezone=tz)
@@ -36,21 +40,25 @@ def db():
 def setup_db():
     with db() as conn:
         c = conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS users(
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS users(
             chat_id INTEGER PRIMARY KEY,
             first_name TEXT,
             username TEXT,
             consent INTEGER DEFAULT 1,
+            expect_bill INTEGER DEFAULT 0,
             created_at TEXT
         )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS visits(
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS visits(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER,
             bill_id TEXT,
             visited_at TEXT,
             survey_sent INTEGER DEFAULT 0
         )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS surveys(
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS surveys(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER,
             bill_id TEXT,
@@ -61,7 +69,8 @@ def setup_db():
             comment TEXT,
             created_at TEXT
         )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS coupons(
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS coupons(
             code TEXT PRIMARY KEY,
             chat_id INTEGER,
             bill_id TEXT,
@@ -76,15 +85,22 @@ def gen_code(n=8):
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(random.choice(alphabet) for _ in range(n))
 
+def main_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📝 Оценить визит"),
+                   KeyboardButton(text="🎟 Мой купон")]],
+        resize_keyboard=True
+    )
+
 def survey_keyboard(step: str):
     if step == "food":
-        label = "Оцените кухню (1–5)"
+        label = "🍽 Оцените кухню (1–5)"
     elif step == "service":
-        label = "Оцените обслуживание (1–5)"
+        label = "🤵 Оцените обслуживание (1–5)"
     elif step == "clean":
-        label = "Оцените чистоту/атмосферу (1–5)"
+        label = "🧼 Оцените чистоту/атмосферу (1–5)"
     elif step == "nps":
-        label = "Порекомендуете нас? (0–10)"
+        label = "⭐️ Порекомендуете нас друзьям? (0–10)"
     else:
         label = ""
     if step == "nps":
@@ -95,6 +111,13 @@ def survey_keyboard(step: str):
     else:
         rows = [[InlineKeyboardButton(text=str(x), callback_data=f"{step}:{x}") for x in range(1,6)]]
     return label, InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def notify_admins(text: str):
+    for admin_id in ADMINS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            pass
 
 async def send_coupon(chat_id: int, bill_id: str | None):
     code = gen_code()
@@ -124,6 +147,8 @@ async def start_survey(chat_id: int, bill_id: str):
         conn.commit()
     await bot.send_message(chat_id, f"🙏 Спасибо за визит в <b>Рибамбель</b>!\n{label}", reply_markup=kb)
 
+# ──────────────────────── HANDLERS ─────────────────────────
+
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
     setup_db()
@@ -134,9 +159,33 @@ async def cmd_start(m: Message):
         )
         conn.commit()
     await m.answer(
-        "Здравствуйте! Это бот <b>Рибамбель</b> для оценки визита и получения скидки.\n"
-        "Если вы были у нас сегодня, отправьте номер счёта командой: <code>/visit 123456</code>"
+        "👋 Добро пожаловать в <b>Рибамбель</b>!\n"
+        "Оцените визит и получите персональный купон на скидку 🎁\n\n"
+        "Нажмите «📝 Оценить визит» и отправьте номер счёта.",
+        reply_markup=main_kb()
     )
+
+@dp.message(F.text == "📝 Оценить визит")
+async def ask_bill(m: Message):
+    with db() as conn:
+        conn.execute("UPDATE users SET expect_bill=1 WHERE chat_id=?", (m.chat.id,))
+        conn.commit()
+    await m.answer("Пожалуйста, отправьте <b>номер счёта</b> (например: 123456).")
+
+@dp.message(F.text == "🎟 Мой купон")
+@dp.message(Command("coupon"))
+async def my_coupon(m: Message):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT code, discount, expires_at, used FROM coupons WHERE chat_id=? ORDER BY rowid DESC LIMIT 1",
+            (m.chat.id,)
+        ).fetchone()
+    if not row:
+        await m.answer("У вас пока нет купонов. Получите его после заполнения короткой анкеты 🙌")
+        return
+    code, discount, expires_at, used = row
+    status = "использован ✅" if used else "активен"
+    await m.answer(f"🎟 Ваш купон: <b>{code}</b>\nСкидка: <b>{discount}%</b>\nДействует до: <b>{expires_at}</b>\nСтатус: {status}")
 
 @dp.message(Command("visit"))
 async def cmd_visit(m: Message):
@@ -150,8 +199,87 @@ async def cmd_visit(m: Message):
             "INSERT INTO visits(chat_id, bill_id, visited_at) VALUES (?,?,?)",
             (m.chat.id, bill_id, datetime.now(tz).isoformat()),
         )
+        conn.execute("UPDATE users SET expect_bill=0 WHERE chat_id=?", (m.chat.id,))
         conn.commit()
-    await m.answer(f"Отлично! Анкета по визиту <b>#{bill_id}</b> придёт завтра в {SURVEY_HOUR:02d}:00. Спасибо!")
+
+    if SURVEY_MODE == "immediate":
+        await m.answer(
+            f"✅ Визит по счёту <b>#{bill_id}</b> зарегистрирован.\n"
+            f"Начинаем опрос — это займёт 30–40 секунд ✨"
+        )
+        await start_survey(m.chat.id, bill_id)
+    else:
+        await m.answer(
+            f"✅ Визит по счёту <b>#{bill_id}</b> зарегистрирован.\n"
+            f"Анкета придёт завтра в {SURVEY_HOUR:02d}:00. Спасибо!",
+            reply_markup=main_kb()
+        )
+
+@dp.message(F.text & ~F.text.startswith(("/",)))
+async def capture_bill_or_comment(m: Message):
+    # если ждём номер счёта — считаем текст номером
+    with db() as conn:
+        row = conn.execute("SELECT expect_bill FROM users WHERE chat_id=?", (m.chat.id,)).fetchone()
+        expect_bill = row and row[0] == 1
+    if expect_bill:
+        bill_id = "".join(ch for ch in m.text if ch.isalnum())
+        if not bill_id:
+            await m.answer("Пожалуйста, пришлите номер счёта цифрами, например: 123456")
+            return
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO visits(chat_id, bill_id, visited_at) VALUES (?,?,?)",
+                (m.chat.id, bill_id, datetime.now(tz).isoformat()),
+            )
+            conn.execute("UPDATE users SET expect_bill=0 WHERE chat_id=?", (m.chat.id,))
+            conn.commit()
+
+        if SURVEY_MODE == "immediate":
+            await m.answer(
+                f"✅ Визит по счёту <b>#{bill_id}</b> зарегистрирован.\n"
+                f"Начинаем опрос — это займёт 30–40 секунд ✨"
+            )
+            await start_survey(m.chat.id, bill_id)
+        else:
+            await m.answer(
+                f"✅ Визит по счёту <b>#{bill_id}</b> зарегистрирован.\n"
+                f"Анкета придёт завтра в {SURVEY_HOUR:02d}:00. Спасибо!",
+                reply_markup=main_kb()
+            )
+        return
+
+    # иначе — это комментарий к последней анкете
+    text = m.text.strip()
+    with db() as conn:
+        r = conn.execute(
+            "SELECT id, bill_id, food, service, clean, nps FROM surveys WHERE chat_id=? ORDER BY id DESC LIMIT 1",
+            (m.chat.id,)
+        ).fetchone()
+        if not r:
+            return
+        sid, bill_id, food, service, clean, nps = r
+        conn.execute("UPDATE surveys SET comment=? WHERE id=?", (text, sid))
+        conn.commit()
+    await m.reply("Получили ваш комментарий ❤️")
+    await send_coupon(m.chat.id, bill_id)
+
+    # эскалация при плохой оценке
+    if ADMINS:
+        bad = (
+            (food is not None and food < 4) or
+            (service is not None and service < 4) or
+            (clean is not None and clean < 4) or
+            (nps is not None and nps <= 6)
+        )
+        if bad:
+            await notify_admins(
+                "🚨 <b>Негативный отзыв</b>\n"
+                f"Гость: <code>{m.chat.id}</code>\n"
+                f"Счёт: <code>{bill_id or '-'}</code>\n"
+                f"🍽 Кухня: {food or '-'} | 🤵 Сервис: {service or '-'} | 🧼 Чистота: {clean or '-'} | ⭐️ NPS: {nps or '-'}\n"
+                f"💬 Комментарий: {text}\n"
+                "→ Свяжитесь с гостем оперативно."
+            )
 
 @dp.message(Command("redeem"))
 async def cmd_redeem(m: Message):
@@ -161,8 +289,7 @@ async def cmd_redeem(m: Message):
         return
     code = args[1].strip().upper()
     with db() as conn:
-        cur = conn.execute("SELECT code, discount, expires_at, used FROM coupons WHERE code=?", (code,))
-        row = cur.fetchone()
+        row = conn.execute("SELECT code, discount, expires_at, used FROM coupons WHERE code=?", (code,)).fetchone()
         if not row:
             await m.answer("Купон не найден.")
             return
@@ -170,7 +297,6 @@ async def cmd_redeem(m: Message):
         if used:
             await m.answer("Купон уже использован.")
             return
-        # срок действия (простая проверка по дате):
         if expires_at < datetime.now(tz).strftime("%Y-%m-%d"):
             await m.answer("Срок действия купона истёк.")
             return
@@ -187,7 +313,12 @@ async def cmd_stats(m: Message):
         v = conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0]
         s = conn.execute("SELECT COUNT(*) FROM surveys").fetchone()[0]
         c = conn.execute("SELECT COUNT(*) FROM coupons WHERE used=1").fetchone()[0]
-    await m.answer(f"Пользователи: {u}\nВизиты: {v}\nАнкет: {s}\nИспользовано купонов: {c}")
+    await m.answer(
+        f"👥 Пользователи: {u}\n"
+        f"🧾 Визиты: {v}\n"
+        f"📝 Анкеты: {s}\n"
+        f"🎟 Купонов использовано: {c}"
+    )
 
 def next_step(current: str):
     order = ["food", "service", "clean", "nps"]
@@ -200,14 +331,20 @@ async def on_rate(cq: CallbackQuery):
     val = int(val)
     chat_id = cq.message.chat.id
     with db() as conn:
-        # последняя анкета пользователя
-        r = conn.execute("SELECT id, bill_id FROM surveys WHERE chat_id=? ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
+        r = conn.execute(
+            "SELECT id, bill_id FROM surveys WHERE chat_id=? ORDER BY id DESC LIMIT 1",
+            (chat_id,)
+        ).fetchone()
         if not r:
-            # нет записи — создадим пустую (редкий случай)
-            conn.execute("INSERT INTO surveys(chat_id, bill_id, created_at) VALUES (?,?,?)",
-                         (chat_id, None, datetime.now(tz).isoformat()))
+            conn.execute(
+                "INSERT INTO surveys(chat_id, bill_id, created_at) VALUES (?,?,?)",
+                (chat_id, None, datetime.now(tz).isoformat())
+            )
             conn.commit()
-            r = conn.execute("SELECT id, bill_id FROM surveys WHERE chat_id=? ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
+            r = conn.execute(
+                "SELECT id, bill_id FROM surveys WHERE chat_id=? ORDER BY id DESC LIMIT 1",
+                (chat_id,)
+            ).fetchone()
         sid, bill_id = r
         field = {"food":"food","service":"service","clean":"clean","nps":"nps"}[step]
         conn.execute(f"UPDATE surveys SET {field}=? WHERE id=?", (val, sid))
@@ -220,31 +357,22 @@ async def on_rate(cq: CallbackQuery):
         await cq.message.answer("Спасибо! Напишите короткий комментарий (или «-», чтобы пропустить).")
     await cq.answer()
 
-@dp.message(F.text & ~F.text.startswith(("/",)))
-async def on_comment(m: Message):
-    text = m.text.strip()
-    with db() as conn:
-        r = conn.execute("SELECT id, bill_id FROM surveys WHERE chat_id=? ORDER BY id DESC LIMIT 1", (m.chat.id,)).fetchone()
-        if not r:
-            return
-        sid, bill_id = r
-        if text != "-":
-            conn.execute("UPDATE surveys SET comment=? WHERE id=?", (text, sid))
-            conn.commit()
-    await m.reply("Получили ваш комментарий ❤️")
-    await send_coupon(m.chat.id, bill_id)
+# ─────────────── SCHEDULER ───────────────
 
 async def survey_scheduler():
     now = datetime.now(tz)
     with db() as conn:
-        rows = conn.execute("SELECT id, chat_id, bill_id, visited_at, survey_sent FROM visits WHERE survey_sent=0").fetchall()
+        rows = conn.execute(
+            "SELECT id, chat_id, bill_id, visited_at, survey_sent FROM visits WHERE survey_sent=0"
+        ).fetchall()
         for vid, chat_id, bill_id, visited_at, sent in rows:
             try:
                 visited_dt = datetime.fromisoformat(visited_at)
             except Exception:
                 visited_dt = now
-            due = (visited_dt + timedelta(days=1)).replace(hour=SURVEY_HOUR, minute=0, second=0, microsecond=0)
-            # Отправляем, если уже пора и не больше чем на 1 час просрочили (чтобы не спамить при рестартах)
+            due = (visited_dt + timedelta(days=1)).replace(
+                hour=SURVEY_HOUR, minute=0, second=0, microsecond=0
+            )
             if now >= due and (now - due) <= timedelta(hours=1):
                 try:
                     await start_survey(chat_id, bill_id)
@@ -255,9 +383,12 @@ async def survey_scheduler():
 
 async def on_startup():
     setup_db()
-    scheduler.add_job(survey_scheduler, "interval", minutes=5, id="survey-tick")
-    scheduler.start()
-    logging.info("Scheduler started. Bot is up.")
+    if SURVEY_MODE == "scheduled":
+        scheduler.add_job(survey_scheduler, "interval", minutes=5, id="survey-tick")
+        scheduler.start()
+        logging.info("Scheduler started (scheduled mode).")
+    else:
+        logging.info("Immediate survey mode enabled.")
 
 async def main():
     await on_startup()
@@ -265,3 +396,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
