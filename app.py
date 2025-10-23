@@ -14,7 +14,7 @@ from keyboards import rating_kb, start_kb, manager_kb, prize_kb
 from prizes import DEFAULT_PRIZES, weighted_choice, gen_code
 
 load_dotenv()
-BOT_TOKEN = os.getenv("bot_token")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 SECRET_KEY = os.getenv("SECRET_KEY", "change_this_secret").encode()
 MANAGERS_CHAT_ID = int(os.getenv("MANAGERS_CHAT_ID", "0"))
 PROMO_VALID_DAYS = int(os.getenv("PROMO_VALID_DAYS", "30"))
