@@ -76,8 +76,7 @@ async def cmd_start(message: Message, command: CommandObject):
             return
         await create_feedback_placeholder(message.from_user.id, visit_id)
         await message.answer(
-            "👋 Добро пожаловать в <b>Рибамбель</b>!
-"
+            "👋 Добро пожаловать в <b>Рибамбель</b>!"
             "Оцените визит (1 минута) — и мы разыграем для вас <b>подарок на следующее посещение</b> 🎁",
             reply_markup=start_kb()
         )
