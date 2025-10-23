@@ -20,7 +20,11 @@ MANAGERS_CHAT_ID = int(os.getenv("MANAGERS_CHAT_ID", "0"))
 PROMO_VALID_DAYS = int(os.getenv("PROMO_VALID_DAYS", "30"))
 DB_PATH = os.getenv("DB_PATH", "./bot.db")
 
-bot = Bot(BOT_TOKEN, parse_mode="HTML")
+from aiogram.client.bot import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
 dp = Dispatcher(storage=MemoryStorage())
 
 conn = get_conn(DB_PATH)
