@@ -106,7 +106,7 @@ async def cb_start_feedback(c: CallbackQuery):
 async def _maybe_alert(feedback_id: int, username: str, table_hint: str, comment: Optional[str]):
     if MANAGERS_CHAT_ID == 0:
         return
-    text = f"⚠️ <b>Сигнал гостя</b>
+    text = f"⚠️ <b>Сигнал гостя</b>"
 От: @{username or 'unknown'}
 {table_hint}"
     if comment:
