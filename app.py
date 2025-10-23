@@ -93,10 +93,8 @@ async def cb_rules(c: CallbackQuery):
     await c.answer()
     await c.message.answer(
         "🎯 <b>Правила акции</b>"
-        "• После короткой оценки вы получаете случайный приз на следующее посещение.
-"
-        f"• Промокод действует {PROMO_VALID_DAYS} дней. Один код = один стол. 
-"
+        "• После короткой оценки вы получаете случайный приз на следующее посещение."
+        f"• Промокод действует {PROMO_VALID_DAYS} дней. Один код = один стол. "
         "• Не суммируется с другими акциями (если не указано иначе)."
     )
 
@@ -110,11 +108,9 @@ async def _maybe_alert(feedback_id: int, username: str, table_hint: str, comment
         return
     text = f"⚠️ <b>Сигнал гостя</b>
 От: @{username or 'unknown'}
-{table_hint}
-"
+{table_hint}"
     if comment:
-        text += f"Комментарий: <i>{comment}</i>
-"
+        text += f"Комментарий: <i>{comment}</i>"
     text += f"ID отзыва: #{feedback_id}"
     await bot.send_message(MANAGERS_CHAT_ID, text, reply_markup=manager_kb(feedback_id))
 
@@ -212,8 +208,7 @@ async def catch_comment(message: Message):
     if row:
         fid = row["id"]
         old = row["comment"] or ""
-        new = (old + "
-" + text).strip() if old else text
+        new = (old + "" + text).strip() if old else text
         with conn:
             conn.execute("UPDATE feedback SET comment=? WHERE id=?", (new, fid))
         # If negative trigger and no alert yet — alert
@@ -237,12 +232,9 @@ async def run_prize_flow(message: Message, visit_id: str):
                      (code, prize["title"], prize["type"], valid_until, message.from_user.id, visit_id, "issued", datetime.utcnow().isoformat()))
     # finalize
     await message.answer(
-        f"🎉 Вам выпал приз: <b>{prize['title']}</b>
-"
-        f"Ваш промокод: <code>{code}</code>
-"
-        f"Действует до <b>{(datetime.utcnow()+timedelta(days=PROMO_VALID_DAYS)).date().strftime('%d.%m.%Y')}</b>.
-"
+        f"🎉 Вам выпал приз: <b>{prize['title']}</b>"
+        f"Ваш промокод: <code>{code}</code>"
+        f"Действует до <b>{(datetime.utcnow()+timedelta(days=PROMO_VALID_DAYS)).date().strftime('%d.%m.%Y')}</b>."
         "Покажите код официанту перед закрытием счёта.",
         reply_markup=prize_kb(code)
     )
@@ -267,10 +259,8 @@ async def cb_show_code(c: CallbackQuery):
 async def cb_terms(c: CallbackQuery):
     await c.answer()
     await c.message.answer(
-        "• Приз действует в течение указанного срока.
-"
-        "• 1 код = 1 стол. Не суммируется с другими акциями (если не указано иначе).
-"
+        "• Приз действует в течение указанного срока."
+        "• 1 код = 1 стол. Не суммируется с другими акциями (если не указано иначе)."
         "• Предъявите код до закрытия счёта."
     )
 
@@ -304,8 +294,7 @@ async def cmd_redeem(message: Message, command: CommandObject):
 @dp.message(Command("gifts"))
 async def cmd_gifts(message: Message):
     # show default pool
-    text = "🎁 Текущие призы (веса):
-"
+    text = "🎁 Текущие призы (веса):"
     text += "\n".join([f"- {p['title']}: {p['weight']}%" for p in DEFAULT_PRIZES])
     await message.answer(text)
 
@@ -325,10 +314,8 @@ async def cmd_stats(message: Message, command: CommandObject):
     cnt = conn.execute("SELECT COUNT(*) c FROM feedback WHERE created_at >= ?", (since.isoformat(),)).fetchone()["c"]
     avg = conn.execute("""SELECT avg(service), avg(taste), avg(speed), avg(clean) FROM feedback WHERE created_at >= ?""", (since.isoformat(),)).fetchone()
     await message.answer(
-        f"📊 За период: {period}
-"
-        f"Отзывов: {cnt}
-"
+        f"📊 За период: {period}"
+        f"Отзывов: {cnt}"
         f"Средние оценки: сервис {avg[0]:.2f} • вкус {avg[1]:.2f} • скорость {avg[2]:.2f} • чистота {avg[3]:.2f}"
         if cnt else f"📊 За период: {period}
 Отзывов пока нет."
