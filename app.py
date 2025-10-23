@@ -1,399 +1,366 @@
-import os, asyncio, logging, sqlite3, random
+from __future__ import annotations
+import asyncio, os, hmac, hashlib, csv
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery, ReplyKeyboardMarkup, KeyboardButton
-)
-from aiogram.filters import Command, CommandStart
-from aiogram.client.default import DefaultBotProperties
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiogram.filters import Command, CommandObject
+from aiogram.types import Message, CallbackQuery, FSInputFile
+from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 
+from db import get_conn, init_db
+from keyboards import rating_kb, start_kb, manager_kb, prize_kb
+from prizes import DEFAULT_PRIZES, weighted_choice, gen_code
+
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMINS = [int(x) for x in os.getenv("ADMINS","").split(",") if x.strip().isdigit()]
-TIMEZONE = os.getenv("TIMEZONE","Asia/Tashkent")
-SURVEY_HOUR = int(os.getenv("SURVEY_HOUR","10"))
-DISCOUNT_PERCENT = int(os.getenv("DISCOUNT_PERCENT","10"))
-COUPON_EXPIRES_DAYS = int(os.getenv("COUPON_EXPIRES_DAYS","30"))
-SURVEY_MODE = os.getenv("SURVEY_MODE", "immediate")  # immediate | scheduled
+SECRET_KEY = os.getenv("SECRET_KEY","change_this_secret").encode()
+MANAGERS_CHAT_ID = int(os.getenv("MANAGERS_CHAT_ID","0"))
+PROMO_VALID_DAYS = int(os.getenv("PROMO_VALID_DAYS","30"))
+DB_PATH = os.getenv("DB_PATH","./bot.db")
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
+bot = Bot(BOT_TOKEN, parse_mode="HTML")
+dp = Dispatcher(storage=MemoryStorage())
 
-# aiogram 3.7+: parse_mode через DefaultBotProperties
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher()
-tz = ZoneInfo(TIMEZONE)
-scheduler = AsyncIOScheduler(timezone=tz)
+conn = get_conn(DB_PATH)
+init_db(conn)
 
-DB = "data.db"
+NEGATIVE_TRIGGERS = ["холод", "солен", "солё", "долго", "волос", "гряз", "невкус", "остыл", "плохо", "хам", "опозд"]
 
-def db():
-    return sqlite3.connect(DB)
+def now_iso():
+    return datetime.utcnow().isoformat()
 
-def setup_db():
-    with db() as conn:
-        c = conn.cursor()
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-            chat_id INTEGER PRIMARY KEY,
-            first_name TEXT,
-            username TEXT,
-            consent INTEGER DEFAULT 1,
-            expect_bill INTEGER DEFAULT 0,
-            created_at TEXT
-        )""")
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS visits(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            bill_id TEXT,
-            visited_at TEXT,
-            survey_sent INTEGER DEFAULT 0
-        )""")
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS surveys(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id INTEGER,
-            bill_id TEXT,
-            food INTEGER,
-            service INTEGER,
-            clean INTEGER,
-            nps INTEGER,
-            comment TEXT,
-            created_at TEXT
-        )""")
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS coupons(
-            code TEXT PRIMARY KEY,
-            chat_id INTEGER,
-            bill_id TEXT,
-            discount INTEGER,
-            expires_at TEXT,
-            used INTEGER DEFAULT 0,
-            used_at TEXT
-        )""")
-        conn.commit()
+def sign_visit(visit_id: str) -> str:
+    return hmac.new(SECRET_KEY, visit_id.encode(), hashlib.sha256).hexdigest()
 
-def gen_code(n=8):
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    return "".join(random.choice(alphabet) for _ in range(n))
+def verify_visit(visit_id: str, sign: str) -> bool:
+    return hmac.compare_digest(sign_visit(visit_id), sign.lower())
 
-def main_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📝 Оценить визит"),
-                   KeyboardButton(text="🎟 Мой купон")]],
-        resize_keyboard=True
-    )
+async def ensure_guest(msg: Message):
+    with conn:
+        conn.execute("INSERT OR IGNORE INTO guests(tg_user_id, username, created_at) VALUES(?,?,?)",
+                     (msg.from_user.id, msg.from_user.username, now_iso()))
 
-def survey_keyboard(step: str):
-    if step == "food":
-        label = "🍽 Оцените кухню (1–5)"
-    elif step == "service":
-        label = "🤵 Оцените обслуживание (1–5)"
-    elif step == "clean":
-        label = "🧼 Оцените чистоту/атмосферу (1–5)"
-    elif step == "nps":
-        label = "⭐️ Порекомендуете нас друзьям? (0–10)"
-    else:
-        label = ""
-    if step == "nps":
-        rows = [
-            [InlineKeyboardButton(text=str(x), callback_data=f"nps:{x}") for x in range(0,6)],
-            [InlineKeyboardButton(text=str(x), callback_data=f"nps:{x}") for x in range(6,11)],
-        ]
-    else:
-        rows = [[InlineKeyboardButton(text=str(x), callback_data=f"{step}:{x}") for x in range(1,6)]]
-    return label, InlineKeyboardMarkup(inline_keyboard=rows)
+async def visit_used(visit_id: str) -> bool:
+    row = conn.execute("SELECT 1 FROM feedback WHERE visit_id = ?", (visit_id,)).fetchone()
+    return row is not None
 
-async def notify_admins(text: str):
-    for admin_id in ADMINS:
+async def create_feedback_placeholder(user_id: int, visit_id: str):
+    with conn:
+        conn.execute("INSERT INTO visits(visit_id, tg_user_id, created_at) VALUES(?,?,?) ON CONFLICT(visit_id) DO NOTHING",
+                     (visit_id, user_id, now_iso()))
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message, command: CommandObject):
+    await ensure_guest(message)
+
+    # Deep link format: visit_<VISIT_ID>_<SIGN>
+    text = message.text or ""
+    arg = command.args or ""
+    visit_id = None
+    if arg and arg.startswith("visit_"):
         try:
-            await bot.send_message(admin_id, text)
+            _, rest = arg.split("visit_", 1)
+            parts = rest.split("_")
+            visit_id = parts[0]
+            sign = parts[1] if len(parts) > 1 else ""
+            if not verify_visit(visit_id, sign):
+                visit_id = None
         except Exception:
-            pass
+            visit_id = None
 
-async def send_coupon(chat_id: int, bill_id: str | None):
-    code = gen_code()
-    expires_at = (datetime.now(tz) + timedelta(days=COUPON_EXPIRES_DAYS)).strftime("%Y-%m-%d")
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO coupons(code, chat_id, bill_id, discount, expires_at) VALUES (?,?,?,?,?)",
-            (code, chat_id, bill_id or "-", DISCOUNT_PERCENT, expires_at),
+    if visit_id:
+        if await visit_used(visit_id):
+            await message.answer("❗️ По этому визиту отзыв уже был оставлен.
+Спасибо за участие!")
+            return
+        await create_feedback_placeholder(message.from_user.id, visit_id)
+        await message.answer(
+            "👋 Добро пожаловать в <b>Рибамбель</b>!
+"
+            "Оцените визит (1 минута) — и мы разыграем для вас <b>подарок на следующее посещение</b> 🎁",
+            reply_markup=start_kb()
         )
-        conn.commit()
-    text = (
-        f"🎉 Спасибо за отзыв!\n"
-        f"Ваш персональный купон: <b>{code}</b>\n"
-        f"Скидка: <b>{DISCOUNT_PERCENT}%</b>\n"
-        f"Действует до: <b>{expires_at}</b>\n"
-        f"Покажите этот код при следующем визите."
-    )
-    await bot.send_message(chat_id, text)
-
-async def start_survey(chat_id: int, bill_id: str):
-    label, kb = survey_keyboard("food")
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO surveys(chat_id, bill_id, created_at) VALUES (?,?,?)",
-            (chat_id, bill_id, datetime.now(tz).isoformat()),
-        )
-        conn.commit()
-    await bot.send_message(chat_id, f"🙏 Спасибо за визит в <b>Рибамбель</b>!\n{label}", reply_markup=kb)
-
-# ──────────────────────── HANDLERS ─────────────────────────
-
-@dp.message(CommandStart())
-async def cmd_start(m: Message):
-    setup_db()
-    with db() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO users(chat_id, first_name, username, consent, created_at) VALUES (?,?,?,?,?)",
-            (m.chat.id, m.from_user.first_name, m.from_user.username, 1, datetime.now(tz).isoformat()),
-        )
-        conn.commit()
-    await m.answer(
-        "👋 Добро пожаловать в <b>Рибамбель</b>!\n"
-        "Оцените визит и получите персональный купон на скидку 🎁\n\n"
-        "Нажмите «📝 Оценить визит» и отправьте номер счёта.",
-        reply_markup=main_kb()
-    )
-
-@dp.message(F.text == "📝 Оценить визит")
-async def ask_bill(m: Message):
-    with db() as conn:
-        conn.execute("UPDATE users SET expect_bill=1 WHERE chat_id=?", (m.chat.id,))
-        conn.commit()
-    await m.answer("Пожалуйста, отправьте <b>номер счёта</b> (например: 123456).")
-
-@dp.message(F.text == "🎟 Мой купон")
-@dp.message(Command("coupon"))
-async def my_coupon(m: Message):
-    with db() as conn:
-        row = conn.execute(
-            "SELECT code, discount, expires_at, used FROM coupons WHERE chat_id=? ORDER BY rowid DESC LIMIT 1",
-            (m.chat.id,)
-        ).fetchone()
-    if not row:
-        await m.answer("У вас пока нет купонов. Получите его после заполнения короткой анкеты 🙌")
-        return
-    code, discount, expires_at, used = row
-    status = "использован ✅" if used else "активен"
-    await m.answer(f"🎟 Ваш купон: <b>{code}</b>\nСкидка: <b>{discount}%</b>\nДействует до: <b>{expires_at}</b>\nСтатус: {status}")
-
-@dp.message(Command("visit"))
-async def cmd_visit(m: Message):
-    args = m.text.split(maxsplit=1)
-    if len(args) < 2:
-        await m.answer("Укажите номер счёта: /visit 123456")
-        return
-    bill_id = args[1].strip()
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO visits(chat_id, bill_id, visited_at) VALUES (?,?,?)",
-            (m.chat.id, bill_id, datetime.now(tz).isoformat()),
-        )
-        conn.execute("UPDATE users SET expect_bill=0 WHERE chat_id=?", (m.chat.id,))
-        conn.commit()
-
-    if SURVEY_MODE == "immediate":
-        await m.answer(
-            f"✅ Визит по счёту <b>#{bill_id}</b> зарегистрирован.\n"
-            f"Начинаем опрос — это займёт 30–40 секунд ✨"
-        )
-        await start_survey(m.chat.id, bill_id)
+        # Cache visit_id in user's memory using a simple dict (per-process)
+        dp['visit_id:' + str(message.from_user.id)] = visit_id
     else:
-        await m.answer(
-            f"✅ Визит по счёту <b>#{bill_id}</b> зарегистрирован.\n"
-            f"Анкета придёт завтра в {SURVEY_HOUR:02d}:00. Спасибо!",
-            reply_markup=main_kb()
+        await message.answer(
+            "👋 Добро пожаловать в <b>Рибамбель</b>!
+"
+            "Сканируйте QR-код на столе, чтобы участвовать в розыгрыше подарков.",
         )
 
-@dp.message(F.text & ~F.text.startswith(("/",)))
-async def capture_bill_or_comment(m: Message):
-    # если ждём номер счёта — считаем текст номером
-    with db() as conn:
-        row = conn.execute("SELECT expect_bill FROM users WHERE chat_id=?", (m.chat.id,)).fetchone()
-        expect_bill = row and row[0] == 1
-    if expect_bill:
-        bill_id = "".join(ch for ch in m.text if ch.isalnum())
-        if not bill_id:
-            await m.answer("Пожалуйста, пришлите номер счёта цифрами, например: 123456")
-            return
-        with db() as conn:
-            conn.execute(
-                "INSERT INTO visits(chat_id, bill_id, visited_at) VALUES (?,?,?)",
-                (m.chat.id, bill_id, datetime.now(tz).isoformat()),
-            )
-            conn.execute("UPDATE users SET expect_bill=0 WHERE chat_id=?", (m.chat.id,))
-            conn.commit()
+@dp.callback_query(F.data == "rules")
+async def cb_rules(c: CallbackQuery):
+    await c.answer()
+    await c.message.answer(
+        "🎯 <b>Правила акции</b>
+"
+        "• После короткой оценки вы получаете случайный приз на следующее посещение.
+"
+        f"• Промокод действует {PROMO_VALID_DAYS} дней. Один код = один стол. 
+"
+        "• Не суммируется с другими акциями (если не указано иначе)."
+    )
 
-        if SURVEY_MODE == "immediate":
-            await m.answer(
-                f"✅ Визит по счёту <b>#{bill_id}</b> зарегистрирован.\n"
-                f"Начинаем опрос — это займёт 30–40 секунд ✨"
-            )
-            await start_survey(m.chat.id, bill_id)
-        else:
-            await m.answer(
-                f"✅ Визит по счёту <b>#{bill_id}</b> зарегистрирован.\n"
-                f"Анкета придёт завтра в {SURVEY_HOUR:02d}:00. Спасибо!",
-                reply_markup=main_kb()
-            )
+@dp.callback_query(F.data == "start_feedback")
+async def cb_start_feedback(c: CallbackQuery):
+    await c.answer()
+    await c.message.answer("Оцените <b>сервис</b>:", reply_markup=rating_kb("service"))
+
+async def _maybe_alert(feedback_id: int, username: str, table_hint: str, comment: Optional[str]):
+    if MANAGERS_CHAT_ID == 0:
         return
+    text = f"⚠️ <b>Сигнал гостя</b>
+От: @{username or 'unknown'}
+{table_hint}
+"
+    if comment:
+        text += f"Комментарий: <i>{comment}</i>
+"
+    text += f"ID отзыва: #{feedback_id}"
+    await bot.send_message(MANAGERS_CHAT_ID, text, reply_markup=manager_kb(feedback_id))
 
-    # иначе — это комментарий к последней анкете
-    text = m.text.strip()
-    with db() as conn:
-        r = conn.execute(
-            "SELECT id, bill_id, food, service, clean, nps FROM surveys WHERE chat_id=? ORDER BY id DESC LIMIT 1",
-            (m.chat.id,)
-        ).fetchone()
-        if not r:
-            return
-        sid, bill_id, food, service, clean, nps = r
-        conn.execute("UPDATE surveys SET comment=? WHERE id=?", (text, sid))
-        conn.commit()
-    await m.reply("Получили ваш комментарий ❤️")
-    await send_coupon(m.chat.id, bill_id)
+def _store_rating(user_id: int, step: str, value: int, visit_id: str):
+    # Insert or update row for this (user, visit)
+    row = conn.execute("SELECT id, service, taste, speed, clean FROM feedback WHERE tg_user_id=? AND visit_id=?",
+                       (user_id, visit_id)).fetchone()
+    if row:
+        fid = row["id"]
+        fields = dict(row)
+        fields[step] = value
+        with conn:
+            conn.execute(f"UPDATE feedback SET {step}=? WHERE id=?", (value, fid))
+        return fid, fields
+    else:
+        with conn:
+            conn.execute("INSERT INTO feedback(tg_user_id, visit_id, created_at, {0}) VALUES(?,?,?,?)".format(step),
+                         (user_id, visit_id, datetime.utcnow().isoformat(), value))
+            fid = conn.execute("SELECT last_insert_rowid() as id").fetchone()["id"]
+        fields = { "service": None, "taste": None, "speed": None, "clean": None }
+        fields[step] = value
+        return fid, fields
 
-    # эскалация при плохой оценке
-    if ADMINS:
-        bad = (
-            (food is not None and food < 4) or
-            (service is not None and service < 4) or
-            (clean is not None and clean < 4) or
-            (nps is not None and nps <= 6)
+def _low_rating(fields: dict) -> bool:
+    vals = [v for v in [fields.get("service"), fields.get("taste"), fields.get("speed"), fields.get("clean")] if v is not None]
+    return any(v <= 3 for v in vals)
+
+@dp.callback_query(F.data.startswith("service:"))
+async def cb_rate_service(c: CallbackQuery):
+    v = int(c.data.split(":")[1])
+    visit_id = dp.get('visit_id:' + str(c.from_user.id))
+    fid, fields = _store_rating(c.from_user.id, "service", v, visit_id)
+    await c.message.edit_text("Оцените <b>вкус блюд</b>:", reply_markup=rating_kb("taste"))
+
+@dp.callback_query(F.data.startswith("taste:"))
+async def cb_rate_taste(c: CallbackQuery):
+    v = int(c.data.split(":")[1])
+    visit_id = dp.get('visit_id:' + str(c.from_user.id))
+    fid, fields = _store_rating(c.from_user.id, "taste", v, visit_id)
+    await c.message.edit_text("Оцените <b>скорость подачи</b>:", reply_markup=rating_kb("speed"))
+
+@dp.callback_query(F.data.startswith("speed:"))
+async def cb_rate_speed(c: CallbackQuery):
+    v = int(c.data.split(":")[1])
+    visit_id = dp.get('visit_id:' + str(c.from_user.id))
+    fid, fields = _store_rating(c.from_user.id, "speed", v, visit_id)
+    await c.message.edit_text("Оцените <b>чистоту и атмосферу</b>:", reply_markup=rating_kb("clean"))
+
+@dp.callback_query(F.data.startswith("clean:"))
+async def cb_rate_clean(c: CallbackQuery):
+    v = int(c.data.split(":")[1])
+    visit_id = dp.get('visit_id:' + str(c.from_user.id))
+    fid, fields = _store_rating(c.from_user.id, "clean", v, visit_id)
+    # Check low rating to propose manager
+    if _low_rating(fields):
+        await c.message.edit_text(
+            "Нам важно исправить ситуацию. Позвать менеджера сейчас?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🆘 Позвать менеджера", callback_data=f"callmgr:{fid}"),
+                InlineKeyboardButton(text="Нет, продолжить", callback_data=f"cont:{fid}")
+            ]])
         )
-        if bad:
-            await notify_admins(
-                "🚨 <b>Негативный отзыв</b>\n"
-                f"Гость: <code>{m.chat.id}</code>\n"
-                f"Счёт: <code>{bill_id or '-'}</code>\n"
-                f"🍽 Кухня: {food or '-'} | 🤵 Сервис: {service or '-'} | 🧼 Чистота: {clean or '-'} | ⭐️ NPS: {nps or '-'}\n"
-                f"💬 Комментарий: {text}\n"
-                "→ Свяжитесь с гостем оперативно."
-            )
+    else:
+        await c.message.edit_text("Оставите короткий комментарий? Напишите сообщением или отправьте «-» чтобы пропустить.")
+
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+@dp.callback_query(F.data.startswith("callmgr:"))
+async def cb_call_manager(c: CallbackQuery):
+    fid = int(c.data.split(":")[1])
+    await c.answer("Менеджер уведомлён")
+    # Lookup for visit/table hint (here just visit_id)
+    row = conn.execute("SELECT visit_id FROM feedback WHERE id=?", (fid,)).fetchone()
+    table_hint = f"Визит: {row['visit_id']}" if row else ""
+    await _maybe_alert(fid, c.from_user.username, table_hint, None)
+    with conn:
+        conn.execute("UPDATE feedback SET alert_sent=1 WHERE id=?", (fid,))
+    await c.message.edit_text("✅ Менеджер уже уведомлён и подойдёт к вам. А пока напишите комментарий, пожалуйста.")
+
+@dp.callback_query(F.data.startswith("cont:"))
+async def cb_continue(c: CallbackQuery):
+    await c.message.edit_text("Оставите короткий комментарий? Напишите сообщением или отправьте «-» чтобы пропустить.")
+
+@dp.message(F.text)
+async def catch_comment(message: Message):
+    # Accept comment only if user is in flow (has visit_id cached)
+    visit_id = dp.get('visit_id:' + str(message.from_user.id))
+    if not visit_id:
+        return
+    text = (message.text or "").strip()
+    if text == "-":
+        text = ""
+    # Save comment
+    row = conn.execute("SELECT id, comment FROM feedback WHERE tg_user_id=? AND visit_id=?", (message.from_user.id, visit_id)).fetchone()
+    if row:
+        fid = row["id"]
+        old = row["comment"] or ""
+        new = (old + "
+" + text).strip() if old else text
+        with conn:
+            conn.execute("UPDATE feedback SET comment=? WHERE id=?", (new, fid))
+        # If negative trigger and no alert yet — alert
+        lowered = (new or "").lower()
+        if any(tok in lowered for tok in NEGATIVE_TRIGGERS):
+            await _maybe_alert(fid, message.from_user.username, f"Визит: {visit_id}", new)
+            with conn:
+                conn.execute("UPDATE feedback SET alert_sent=1 WHERE id=?", (fid,))
+    # Move to prize
+    await run_prize_flow(message, visit_id)
+
+async def run_prize_flow(message: Message, visit_id: str):
+    await message.answer("🎡 Запускаем колесо подарков…")
+    # choose prize
+    prize = weighted_choice(DEFAULT_PRIZES)
+    code = gen_code()
+    valid_until = (datetime.utcnow() + timedelta(days=PROMO_VALID_DAYS)).isoformat()
+    with conn:
+        conn.execute("""INSERT INTO prizes(code, title, type, valid_until, user_id, visit_id, status, created_at)
+                        VALUES(?,?,?,?,?,?,?,?)""",
+                     (code, prize["title"], prize["type"], valid_until, message.from_user.id, visit_id, "issued", datetime.utcnow().isoformat()))
+    # finalize
+    await message.answer(
+        f"🎉 Вам выпал приз: <b>{prize['title']}</b>
+"
+        f"Ваш промокод: <code>{code}</code>
+"
+        f"Действует до <b>{(datetime.utcnow()+timedelta(days=PROMO_VALID_DAYS)).date().strftime('%d.%m.%Y')}</b>.
+"
+        "Покажите код официанту перед закрытием счёта.",
+        reply_markup=prize_kb(code)
+    )
+    # end flow
+    dp.pop('visit_id:' + str(message.from_user.id), None)
+
+@dp.callback_query(F.data.startswith("show:"))
+async def cb_show_code(c: CallbackQuery):
+    code = c.data.split(":")[1]
+    row = conn.execute("SELECT title, valid_until, status FROM prizes WHERE code=?", (code,)).fetchone()
+    if not row:
+        await c.answer("Код не найден", show_alert=True)
+        return
+    dt = row["valid_until"][:10] if row["valid_until"] else "-"
+    await c.answer()
+    await c.message.answer(f"🎟 Промокод <code>{code}</code>
+Приз: <b>{row['title']}</b>
+Статус: {row['status']}
+Действует до: {dt}")
+
+@dp.callback_query(F.data == "terms")
+async def cb_terms(c: CallbackQuery):
+    await c.answer()
+    await c.message.answer(
+        "• Приз действует в течение указанного срока.
+"
+        "• 1 код = 1 стол. Не суммируется с другими акциями (если не указано иначе).
+"
+        "• Предъявите код до закрытия счёта."
+    )
+
+# ===== Staff / Admin =====
 
 @dp.message(Command("redeem"))
-async def cmd_redeem(m: Message):
-    args = m.text.split(maxsplit=1)
-    if len(args) < 2:
-        await m.answer("Укажите код купона: /redeem ABCD1234")
+async def cmd_redeem(message: Message, command: CommandObject):
+    if not command.args:
+        await message.answer("Использование: /redeem <CODE>")
         return
-    code = args[1].strip().upper()
-    with db() as conn:
-        row = conn.execute("SELECT code, discount, expires_at, used FROM coupons WHERE code=?", (code,)).fetchone()
-        if not row:
-            await m.answer("Купон не найден.")
+    code = command.args.strip().upper()
+    row = conn.execute("SELECT status, title, valid_until FROM prizes WHERE code=?", (code,)).fetchone()
+    if not row:
+        await message.answer("❌ Код не найден")
+        return
+    if row["status"] != "issued":
+        await message.answer(f"Статус кода: {row['status']} — погасить нельзя")
+        return
+    # check date
+    try:
+        if datetime.utcnow() > datetime.fromisoformat(row["valid_until"]):
+            await message.answer("⏳ Срок действия истёк")
             return
-        code, discount, expires_at, used = row
-        if used:
-            await m.answer("Купон уже использован.")
-            return
-        if expires_at < datetime.now(tz).strftime("%Y-%m-%d"):
-            await m.answer("Срок действия купона истёк.")
-            return
-        conn.execute("UPDATE coupons SET used=1, used_at=? WHERE code=?", (datetime.now(tz).isoformat(), code))
-        conn.commit()
-    await m.answer(f"✅ Купон <b>{code}</b> применён. Скидка {discount}% предоставлена.")
+    except Exception:
+        pass
+    with conn:
+        conn.execute("UPDATE prizes SET status='redeemed', redeemed_at=?, redeemed_by=? WHERE code=?",
+                     (datetime.utcnow().isoformat(), message.from_user.id, code))
+    await message.answer(f"✅ Погашено. Приз: <b>{row['title']}</b>")
+
+@dp.message(Command("gifts"))
+async def cmd_gifts(message: Message):
+    # show default pool
+    text = "🎁 Текущие призы (веса):
+"
+    text += "\n".join([f"- {p['title']}: {p['weight']}%" for p in DEFAULT_PRIZES])
+    await message.answer(text)
 
 @dp.message(Command("stats"))
-async def cmd_stats(m: Message):
-    if m.chat.id not in ADMINS:
+async def cmd_stats(message: Message, command: CommandObject):
+    period = (command.args or "today").strip()
+    now = datetime.utcnow()
+    if period == "today":
+        since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "week":
+        since = now - timedelta(days=7)
+    elif period == "month":
+        since = now - timedelta(days=30)
+    else:
+        await message.answer("Использование: /stats [today|week|month]")
         return
-    with db() as conn:
-        u = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        v = conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0]
-        s = conn.execute("SELECT COUNT(*) FROM surveys").fetchone()[0]
-        c = conn.execute("SELECT COUNT(*) FROM coupons WHERE used=1").fetchone()[0]
-    await m.answer(
-        f"👥 Пользователи: {u}\n"
-        f"🧾 Визиты: {v}\n"
-        f"📝 Анкеты: {s}\n"
-        f"🎟 Купонов использовано: {c}"
+    cnt = conn.execute("SELECT COUNT(*) c FROM feedback WHERE created_at >= ?", (since.isoformat(),)).fetchone()["c"]
+    avg = conn.execute("""SELECT avg(service), avg(taste), avg(speed), avg(clean) FROM feedback WHERE created_at >= ?""", (since.isoformat(),)).fetchone()
+    await message.answer(
+        f"📊 За период: {period}
+"
+        f"Отзывов: {cnt}
+"
+        f"Средние оценки: сервис {avg[0]:.2f} • вкус {avg[1]:.2f} • скорость {avg[2]:.2f} • чистота {avg[3]:.2f}"
+        if cnt else f"📊 За период: {period}
+Отзывов пока нет."
     )
 
-def next_step(current: str):
-    order = ["food", "service", "clean", "nps"]
-    i = order.index(current)
-    return order[i+1] if i < len(order)-1 else None
-
-@dp.callback_query(F.data.startswith(("food:","service:","clean:","nps:")))
-async def on_rate(cq: CallbackQuery):
-    step, val = cq.data.split(":")
-    val = int(val)
-    chat_id = cq.message.chat.id
-    with db() as conn:
-        r = conn.execute(
-            "SELECT id, bill_id FROM surveys WHERE chat_id=? ORDER BY id DESC LIMIT 1",
-            (chat_id,)
-        ).fetchone()
-        if not r:
-            conn.execute(
-                "INSERT INTO surveys(chat_id, bill_id, created_at) VALUES (?,?,?)",
-                (chat_id, None, datetime.now(tz).isoformat())
-            )
-            conn.commit()
-            r = conn.execute(
-                "SELECT id, bill_id FROM surveys WHERE chat_id=? ORDER BY id DESC LIMIT 1",
-                (chat_id,)
-            ).fetchone()
-        sid, bill_id = r
-        field = {"food":"food","service":"service","clean":"clean","nps":"nps"}[step]
-        conn.execute(f"UPDATE surveys SET {field}=? WHERE id=?", (val, sid))
-        conn.commit()
-    ns = next_step(step)
-    if ns:
-        label, kb = survey_keyboard(ns)
-        await cq.message.answer(label, reply_markup=kb)
-    else:
-        await cq.message.answer("Спасибо! Напишите короткий комментарий (или «-», чтобы пропустить).")
-    await cq.answer()
-
-# ─────────────── SCHEDULER ───────────────
-
-async def survey_scheduler():
-    now = datetime.now(tz)
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT id, chat_id, bill_id, visited_at, survey_sent FROM visits WHERE survey_sent=0"
-        ).fetchall()
-        for vid, chat_id, bill_id, visited_at, sent in rows:
-            try:
-                visited_dt = datetime.fromisoformat(visited_at)
-            except Exception:
-                visited_dt = now
-            due = (visited_dt + timedelta(days=1)).replace(
-                hour=SURVEY_HOUR, minute=0, second=0, microsecond=0
-            )
-            if now >= due and (now - due) <= timedelta(hours=1):
-                try:
-                    await start_survey(chat_id, bill_id)
-                    conn.execute("UPDATE visits SET survey_sent=1 WHERE id=?", (vid,))
-                    conn.commit()
-                except Exception as e:
-                    logging.exception("Failed to send survey: %s", e)
-
-async def on_startup():
-    setup_db()
-    if SURVEY_MODE == "scheduled":
-        scheduler.add_job(survey_scheduler, "interval", minutes=5, id="survey-tick")
-        scheduler.start()
-        logging.info("Scheduler started (scheduled mode).")
-    else:
-        logging.info("Immediate survey mode enabled.")
+@dp.message(Command("export"))
+async def cmd_export(message: Message):
+    # export CSV
+    fname = "export_feedback_prizes.csv"
+    path = os.path.abspath(fname)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(["created_at","tg_user_id","visit_id","service","taste","speed","clean","comment","prize_code","prize_title","prize_status","valid_until"])
+        rows = conn.execute("""
+            SELECT f.created_at,f.tg_user_id,f.visit_id,f.service,f.taste,f.speed,f.clean,f.comment,
+                   p.code,p.title,p.status,p.valid_until
+            FROM feedback f
+            LEFT JOIN prizes p ON p.user_id=f.tg_user_id AND p.visit_id=f.visit_id
+            ORDER BY f.created_at DESC
+        """).fetchall()
+        for r in rows:
+            w.writerow([r["created_at"], r["tg_user_id"], r["visit_id"], r["service"], r["taste"], r["speed"], r["clean"], (r["comment"] or "").replace("\n"," "), r["code"] if "code" in r.keys() else "", r["title"] if "title" in r.keys() else "", r["status"] if "status" in r.keys() else "", r["valid_until"] if "valid_until" in r.keys() else ""])
+    await message.answer_document(FSInputFile(path))
 
 async def main():
-    await on_startup()
+    assert BOT_TOKEN and BOT_TOKEN != "8018287894:REPLACE_ME", "Заполните BOT_TOKEN в .env"
+    print("Bot started")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-

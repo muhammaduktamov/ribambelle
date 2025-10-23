@@ -1,32 +1,40 @@
-# Ribambelle Feedback Bot (Render-ready)
+# Ribambelle Feedback Bot (Python, aiogram v3)
 
-Telegram-бот для пост-визитной оценки и скидочных купонов. Готов к деплою на Render как **Background Worker**.
+Функции:
+- Вход по QR `https://t.me/<botname>?start=visit_<VISIT_ID>_<SIGN>` (HMAC-подпись).
+- 4 оценки (сервис, вкус, скорость, чистота) + комментарий (по желанию).
+- Триггер проблемных отзывов → мгновенное уведомление в менеджерский чат с кнопкой «Принято».
+- Рандомайзер призов (веса) → промокод на следующее посещение с ограничением по сроку.
+- Команда `/redeem <CODE>` для погашения (официант/касса).
+- Команды админа: `/stats`, `/gifts`, `/gifts_set JSON`, `/export`.
 
-## Локальный запуск (Mac)
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+## Быстрый старт
+1) Python 3.10+
+2) Создать `.env` из примера:
+```
 cp .env.example .env
-# отредактируй .env и затем:
-export $(cat .env | xargs)
+# отредактируйте BOT_TOKEN, SECRET_KEY, MANAGERS_CHAT_ID
+```
+3) Установка:
+```
+pip install -r requirements.txt
+```
+4) Запуск:
+```
 python app.py
 ```
 
-## Деплой на Render (Blueprint)
-1) Запушь этот код в GitHub (репозиторий).
-2) На render.com → **New** → **Blueprint** → выбери репозиторий.
-3) Render прочитает `render.yaml` и создаст Worker.
-4) В Variables добавь `BOT_TOKEN` (секрет), остальное можно оставить как в yaml.
-5) Запусти деплой.
+## QR-ссылка
+Формат: `https://t.me/<botname>?start=visit_<VISIT_ID>_<SIGN>`  
+Где `SIGN = hex(hmac_sha256(SECRET_KEY, VISIT_ID))`  
+Пример генерации подписи: `python tools/sign_visit.py VISIT_ABC`
 
-> Сейчас используется SQLite (файл data.db). На бесплатном Render диск может обнуляться при ребилде. Для продакшена стоит перейти на PostgreSQL или платный Persistent Disk.
+## Таблицы
+SQLite `bot.db` (создаётся автоматически):
+- guests(tg_user_id, username, phone, created_at)
+- visits(visit_id, tg_user_id, created_at)
+- feedback(id, tg_user_id, visit_id, service, taste, speed, clean, comment, photo_id, created_at, alert_sent)
+- prizes(code, title, type, valid_until, user_id, visit_id, status, created_at, redeemed_at, redeemed_by)
 
-## Команды бота
-- `/start` — регистрация/согласие.
-- `/visit <bill_id>` — зафиксировать визит (опрос придет на след. день в SURVEY_HOUR).
-- `/redeem <COUPON>` — погасить купон.
-- `/stats` — краткая статистика (только для ADMINS).
-
-## Импорт визитов
-CSV с колонками: `chat_id,bill_id,visited_at(ISO)` → см. `import_visits.py`.
+## Импорт/экспорт
+- `/export` отправит CSV с данными отзывов и призов.
