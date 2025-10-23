@@ -5,14 +5,14 @@ from typing import List, Dict
 
 # Базовый пул призов с весами
 DEFAULT_PRIZES: List[Dict] = [
-    {"key":"coffee","title":"Кофе/чай в подарок","weight":20,"type":"gift"},
-    {"key":"dessert","title":"Десерт дня в подарок","weight":20,"type":"gift"},
-    {"key":"lemonade","title":"Лимонад 0.3 в подарок","weight":15,"type":"gift"},
-    {"key":"disc10","title":"Скидка 10%","weight":15,"type":"discount"},
-    {"key":"pizza","title":"Пицца Маргарита (S)","weight":10,"type":"gift"},
-    {"key":"kids","title":"Детская анимация (бесплатно)","weight":10,"type":"service"},
-    {"key":"disc20","title":"Скидка 20%","weight":5,"type":"discount"},
-    {"key":"chef","title":"Сюрприз от шефа","weight":5,"type":"gift"}
+    {"key":"coffee","title":"Городок в будний день в подарок","weight":20,"type":"gift"},
+    {"key":"dessert","title":"Десерт с витрины в подарок","weight":20,"type":"gift"},
+    {"key":"lemonade","title":"Любой лимонад 0.4 в подарок","weight":15,"type":"gift"},
+    {"key":"disc10","title":"Скидка 20% на завтрак","weight":15,"type":"discount"},
+    {"key":"pizza","title":"Пицца Маргарита ","weight":10,"type":"gift"},
+    {"key":"kids","title":"Детский кулинарный мастер класс (бесплатно)","weight":10,"type":"service"},
+    {"key":"disc20","title":"Скидка 20% на завтрак","weight":5,"type":"discount"},
+    {"key":"chef","title":"Скидка 10% на банкет","weight":5,"type":"gift"}
 ]
 
 def weighted_choice(items: List[Dict]) -> Dict:
