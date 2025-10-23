@@ -18,19 +18,6 @@ from aiogram.types import Message
 router = Router()
 
 START_TS = time.time()
-
-@router.message(F.text == "/where")
-async def where_am_i(message: Message):
-    host = socket.gethostname()
-    pid = os.getpid()
-    up = int(time.time() - START_TS)
-    token_tail = os.getenv("BOT_TOKEN", "")[-6:]  # только хвост токена
-    await message.answer(
-        f"🤖 Я запущен на: <b>{host}</b>\n"
-        f"PID: <code>{pid}</code>\n"
-        f"Uptime: {up} сек\n"
-        f"Token…{token_tail}"
-    )
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SECRET_KEY = os.getenv("SECRET_KEY", "change_this_secret").encode()
@@ -379,7 +366,25 @@ async def cmd_stats(message: Message, command: CommandObject):
         )
     else:
         await message.answer(f"📊 За период: {period}\nОтзывов пока нет.")
+import os, socket, time
+from aiogram import Router, F
+from aiogram.types import Message
+router = Router()
 
+START_TS = time.time()
+
+@router.message(F.text == "/where")
+async def where_am_i(message: Message):
+    host = socket.gethostname()
+    pid = os.getpid()
+    up = int(time.time() - START_TS)
+    token_tail = os.getenv("BOT_TOKEN", "")[-6:]  # только хвост токена
+    await message.answer(
+        f"🤖 Я запущен на: <b>{host}</b>\n"
+        f"PID: <code>{pid}</code>\n"
+        f"Uptime: {up} сек\n"
+        f"Token…{token_tail}"
+    )
 @dp.message(Command("export"))
 async def cmd_export(message: Message):
     fname = "export_feedback_prizes.csv"
