@@ -1,17 +1,3 @@
-from aiogram.client.bot import DefaultBotProperties
-from aiogram.enums import ParseMode
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-# Диагностика (маскируем токен в логах)
-mask = (BOT_TOKEN[:6] + "..." + BOT_TOKEN[-4:]) if BOT_TOKEN else "None"
-print("BOT_TOKEN present:", BOT_TOKEN is not None, "value(masked):", mask)
-
-if not BOT_TOKEN or ":" not in BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN отсутствует или неверный. Задайте его в Render → Environment → BOT_TOKEN.")
-
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-
 from __future__ import annotations
 import asyncio, os, hmac, hashlib, csv
 from datetime import datetime, timedelta
