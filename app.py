@@ -109,7 +109,7 @@ async def _maybe_alert(feedback_id: int, username: str, table_hint: str, comment
     text = f"⚠️ <b>Сигнал гостя</b>"
 text = f"От: @{username or 'unknown'}"
 "{table_hint}"
-    if comment:
+if comment:
         text += f"Комментарий: <i>{comment}</i>"
     text += f"ID отзыва: #{feedback_id}"
     await bot.send_message(MANAGERS_CHAT_ID, text, reply_markup=manager_kb(feedback_id))
